@@ -1,9 +1,7 @@
 package graphpipe
 
 import (
-	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 
 	"github.com/Sirupsen/logrus"
@@ -23,19 +21,18 @@ func Remote(uri string, in interface{}) (interface{}, error) {
 	return res[0], err
 }
 
-// MultiRemote is the complicated function for making a remote model request.
-// It supports multiple inputs and outputs, custom clients, and config strings.
-// If inputNames or outputNames is empty, it will use the default inputs and
-// outputs from the server.  For multiple inputs and outputs, it is recommended
-// that you Specify inputNames and outputNames so that you can control
-// input/output ordering.  MultiRemote also performs type introspection for
-// inputs and outputs.
-func MultiRemote(client *http.Client, uri string, config string, ins []interface{}, inputNames, outputNames []string) ([]interface{}, error) {
+// MultiRemote is the complicated function for making a remote model request. It
+// supports multiple inputs and outputs, custom http clients, and config
+// strings. If inputNames or outputNames is empty, it will use the default
+// inputs and outputs from the server.  For multiple inputs and outputs, it is
+// recommended that you Specify inputNames and outputNames so that you can
+// control input/output ordering.  MultiRemote also performs type introspection
+// for inputs and outputs.
+func MultiRemote(httpClient *http.Client, uri string, config string, ins []interface{}, inputNames, outputNames []string) ([]interface{}, error) {
 	inputs := make([]*NativeTensor, len(ins))
 	for i := range ins {
-		var err error
 		nt := &NativeTensor{}
-		err = nt.InitSimple(ins[i])
+		err := nt.InitSimple(ins[i])
 		inputs[i] = nt
 		if err != nil {
 			logrus.Errorf("Failed to convert input %d: %v", i, err)
@@ -43,7 +40,11 @@ func MultiRemote(client *http.Client, uri string, config string, ins []interface
 		}
 	}
 
-	outputs, err := MultiRemoteRaw(client, uri, config, inputs, inputNames, outputNames)
+	client := HttpClient {
+		NetHttpClient: httpClient,
+		Uri: uri,
+	}	
+	outputs, err := MultiRemoteRaw(client, config, inputs, inputNames, outputNames)
 	if err != nil {
 		logrus.Errorf("Failed to MultiRemoteRaw: %v", err)
 		return nil, err
@@ -63,35 +64,57 @@ func MultiRemote(client *http.Client, uri string, config string, ins []interface
 // MultiRemoteRaw is the actual implementation of the remote model
 // request using NativeTensor objects. The raw call is provided
 // for requests that need optimal performance and do not need to
-// be converted into native go types.
-func MultiRemoteRaw(client *http.Client, uri string, config string, inputs []*NativeTensor, inputNames, outputNames []string) ([]*NativeTensor, error) {
-	b := fb.NewBuilder(1024)
+// be converted into native go types. It also allows for other types of
+// Clients.
+func MultiRemoteRaw(client Client, config string, inputs []*NativeTensor, inputNames, outputNames []string) ([]*NativeTensor, error) {
+	b := client.builder()
+	buf := buildInferRequest(b, config, inputs, inputNames, outputNames)
+	body, err := client.call(b, buf)
+	if err != nil {
+		return nil, err
+	}
+	
+	res := graphpipefb.GetRootAsInferResponse(body, 0)
 
+	rval := make([]*NativeTensor, res.OutputTensorsLength())
+	for i := 0; i < res.OutputTensorsLength(); i++ {
+		tensor := &graphpipefb.Tensor{}
+		if !res.OutputTensors(tensor, i) {
+			err := fmt.Errorf("Bad output tensor #%d", i)
+			return nil, err
+		}
+		rval[i] = TensorToNativeTensor(tensor)
+	}
+	
+	return rval, nil
+}
+
+func buildInferRequest(b *fb.Builder, config string, inputs[]*NativeTensor, inputNames, outputNames []string) []byte {
 	inStrs := make([]fb.UOffsetT, len(inputNames))
 	outStrs := make([]fb.UOffsetT, len(outputNames))
 
 	for i := range inStrs {
-		inStrs[i] = b.CreateString(inputNames[i])
+		inStrs[i] = (*b).CreateString(inputNames[i])
 	}
 
 	for i := range outStrs {
-		outStrs[i] = b.CreateString(outputNames[i])
+		outStrs[i] = (*b).CreateString(outputNames[i])
 	}
 
 	graphpipefb.InferRequestStartInputNamesVector(b, len(inStrs))
 	for i := len(inStrs) - 1; i >= 0; i-- {
 		offset := inStrs[i]
-		b.PrependUOffsetT(offset)
+		(*b).PrependUOffsetT(offset)
 	}
 
-	inputNamesOffset := b.EndVector(len(inStrs))
+	inputNamesOffset := (*b).EndVector(len(inStrs))
 
 	graphpipefb.InferRequestStartOutputNamesVector(b, len(outStrs))
 	for i := len(outStrs) - 1; i >= 0; i-- {
 		offset := outStrs[i]
-		b.PrependUOffsetT(offset)
+		(*b).PrependUOffsetT(offset)
 	}
-	outputNamesOffset := b.EndVector(len(outStrs))
+	outputNamesOffset := (*b).EndVector(len(outStrs))
 
 	inputOffsets := make([]fb.UOffsetT, len(inputs))
 	for i := 0; i < len(inputs); i++ {
@@ -101,11 +124,11 @@ func MultiRemoteRaw(client *http.Client, uri string, config string, inputs []*Na
 	graphpipefb.InferRequestStartInputTensorsVector(b, len(inputs))
 	for i := len(inputOffsets) - 1; i >= 0; i-- {
 		offset := inputOffsets[i]
-		b.PrependUOffsetT(offset)
+		(*b).PrependUOffsetT(offset)
 	}
-	inputTensors := b.EndVector(len(inputs))
+	inputTensors := (*b).EndVector(len(inputs))
 
-	configString := b.CreateString(config)
+	configString := (*b).CreateString(config)
 
 	graphpipefb.InferRequestStart(b)
 	graphpipefb.InferRequestAddInputNames(b, inputNamesOffset)
@@ -118,44 +141,6 @@ func MultiRemoteRaw(client *http.Client, uri string, config string, inputs []*Na
 	graphpipefb.RequestAddReq(b, inferRequestOffset)
 	requestOffset := graphpipefb.RequestEnd(b)
 
-	buf := Serialize(b, requestOffset)
-
-	rq, err := http.NewRequest("POST", uri, bytes.NewReader(buf))
-	if err != nil {
-		logrus.Errorf("Failed to create request: %v", err)
-		return nil, err
-	}
-
-	// send the request
-	rs, err := client.Do(rq)
-	if err != nil {
-		logrus.Errorf("Failed to send request: %v", err)
-		return nil, err
-	}
-	defer rs.Body.Close()
-
-	body, err := ioutil.ReadAll(rs.Body)
-	if err != nil {
-		logrus.Errorf("Failed to read body: %v", err)
-		return nil, err
-	}
-	if rs.StatusCode != 200 {
-		return nil, fmt.Errorf("Remote failed with %d: %s", rs.StatusCode, string(body))
-	}
-
-	res := graphpipefb.GetRootAsInferResponse(body, 0)
-
-	rval := make([]*NativeTensor, res.OutputTensorsLength())
-
-	for i := 0; i < res.OutputTensorsLength(); i++ {
-		tensor := &graphpipefb.Tensor{}
-		if !res.OutputTensors(tensor, i) {
-			err := fmt.Errorf("Bad input tensor")
-			return nil, err
-		}
-		nt := TensorToNativeTensor(tensor)
-		rval[i] = nt
-	}
-
-	return rval, nil
+	return Serialize(b, requestOffset)
 }
+

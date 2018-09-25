@@ -219,9 +219,13 @@ func serve(opts options) error {
 				Proxy:               http.ProxyFromEnvironment,
 				TLSHandshakeTimeout: 5 * time.Second,
 			}
-			var client = &http.Client{
+			var httpClient = &http.Client{
 				Timeout:   time.Second * 60,
 				Transport: transport,
+			}
+			var client = graphpipe.HttpClient{
+				NetHttpClient: httpClient,
+				Uri: opts.targetURL,
 			}
 
 			data := []*ioData{}
@@ -308,7 +312,7 @@ func serve(opts options) error {
 						inputs = append(inputs, &nt)
 					}
 					//ship it!
-					tensors, err := graphpipe.MultiRemoteRaw(client, opts.targetURL, "", inputs, inputNames, outputNames)
+					tensors, err := graphpipe.MultiRemoteRaw(client, "", inputs, inputNames, outputNames)
 					if err != nil {
 						for _, io := range data {
 							io.Error = err
